@@ -1,0 +1,168 @@
+name: Model Training Feedback Loop
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  train-and-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # to check out the repository
+      issues: write         # CML needs this to post commit/issue comments
+      pull-requests: write  # CML needs this to post PR comments
+    # Keep wall-clock time reasonable for a free runner (max 6 h).
+    timeout-minutes: 360
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python environment ──────────────────────────────────────────────
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      # ── 3. Install CML (Continuous Machine Learning reporting tool) ───────
+      - name: Set up CML
+        uses: iterative/setup-cml@v2
+
+      # ── 4. Install dependencies ────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 5. Resolve experiment config from branch ───────────────────────────
+      # Notes vs. repo 1:
+      #   * `feature_set=initial` here means the FULL 16-IMU 160-channel set
+      #     (in repo 1 it meant the 10 head-only channels).
+      #   * Added `exp-7-head-only` so a branch can reproduce repo-1 numbers
+      #     using the same feature subset on the same data.
+      - name: Resolve experiment configuration
+        shell: bash
+        run: |
+          branch="${GITHUB_REF_NAME}"
+          feature_set="initial"
+          split_strategy="group"
+          rf_top_k="40"
+          pattern_clusters="4"
+
+          case "$branch" in
+            exp-1-initial-features)
+              ;;
+            exp-2-restricted-features)
+              feature_set="restricted"
+              ;;
+            exp-3-rf-importance)
+              feature_set="rf_importance"
+              rf_top_k="40"
+              ;;
+            exp-4-temporal-split)
+              split_strategy="temporal"
+              ;;
+            exp-5-pattern-split)
+              split_strategy="pattern"
+              pattern_clusters="4"
+              ;;
+            exp-6-random-split)
+              split_strategy="random"
+              ;;
+            exp-7-head-only)
+              feature_set="head_only"
+              ;;
+            *)
+              echo "Using baseline experiment settings for branch: $branch"
+              ;;
+          esac
+
+          echo "EXPERIMENT_BRANCH=$branch" >> "$GITHUB_ENV"
+          echo "FEATURE_SET=$feature_set" >> "$GITHUB_ENV"
+          echo "SPLIT_STRATEGY=$split_strategy" >> "$GITHUB_ENV"
+          echo "RF_TOP_K=$rf_top_k" >> "$GITHUB_ENV"
+          echo "PATTERN_CLUSTERS=$pattern_clusters" >> "$GITHUB_ENV"
+
+          echo "Resolved config -> branch=$branch, feature_set=$feature_set, split_strategy=$split_strategy, rf_top_k=$rf_top_k, pattern_clusters=$pattern_clusters"
+
+      # ── 6. Preprocess raw SDSU CSVs into per-trial files ──────────────────
+      # New step (no equivalent in repo 1): builds
+      # data/processed/separate_trials/trial_XX/trial_XX_full.csv from
+      # original_data/. train.py expects this layout.
+      - name: Preprocess SDSU dataset
+        run: python scripts/process_falls.py
+
+      # ── 7. Train models ────────────────────────────────────────────────────
+      - name: Train fall-detection models
+        run: python train.py
+
+      # ── 8. Build CML report and post it as a commit/PR comment ────────────
+      - name: Create CML report
+        continue-on-error: true
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "## 🤖 Fall Detection (full IMU) — Training Results" > report.md
+          echo "" >> report.md
+
+          echo "### 📊 Metrics" >> report.md
+          echo '```' >> report.md
+          cat metrics.txt >> report.md
+          echo '```' >> report.md
+          echo "" >> report.md
+
+          echo "### 🟦 Confusion Matrices" >> report.md
+          cml publish confusion_matrices.png --md >> report.md
+          echo "" >> report.md
+
+          echo "### 📈 Training History (Neural Network)" >> report.md
+          cml publish training_history.png --md >> report.md
+          echo "" >> report.md
+
+          echo "### 🌲 Feature Importance (Random Forest)" >> report.md
+          cml publish feature_importance.png --md >> report.md
+          echo "" >> report.md
+
+          echo "### ℹ️ Evaluation Methodology" >> report.md
+          echo "- **Branch**: \`${EXPERIMENT_BRANCH}\`" >> report.md
+          echo "- **Feature set**: \`${FEATURE_SET}\` (initial = 160-channel full IMU)" >> report.md
+          echo "- **Split strategy**: \`${SPLIT_STRATEGY}\`" >> report.md
+          echo "- **Thresholding**: calibration-tuned per model (base fallback \`${THRESHOLD:-0.55}\`)" >> report.md
+          echo "- **Selection objective**: precision-aware (F0.5) + reported BestF1Thr (informational)" >> report.md
+          echo "- Companion to **Sensor-Based-Fall-detection** (head-only, 10 channels). Use branch \`exp-7-head-only\` to reproduce repo-1 numbers on the same data." >> report.md
+          echo "" >> report.md
+
+          echo "---" >> report.md
+          echo "_Report generated automatically by [CML](https://cml.dev) on commit \`${{ github.sha }}\`._" >> report.md
+
+          cml comment create report.md
+
+      # ── 9. Upload training/export artifacts ───────────────────────────────
+      - name: Upload training artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fall-detection-artifacts-${{ github.run_number }}-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            metrics.txt
+            metrics.json
+            report.md
+            confusion_matrices.png
+            training_history.png
+            feature_importance.png
+            scaler_params.json
+            scaler_params.h
+            fall_detector_rf.pkl
+            feat_scaler.pkl
+            seq_scaler.pkl
+            fall_detector_micromlgen.h
+            fall_detector_m2cgen.c
+            fall_detector_emlearn.h
+            fall_detector_nn_int8.tflite
+            fall_detector_lstm_int8.tflite
